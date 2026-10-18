@@ -1,19 +1,32 @@
 const canvas = document.getElementById('stage');
 const ctx = canvas.getContext('2d');
 
-const DOT_RADIUS = 6;
-const ANIM_DURATION = 1200;
+const ANIM_DURATION = 1200;      // опорная длительность (для «средней» дистанции)
 const MAX_FORMATION_WIDTH = 1400;
+const MAX_N = 400;
+const MAX_T = 10;
+const INITIAL_N = 4;
+
+// Радиус точки
+const R_MIN = 2.5;
+const R_MAX = 6;
+
+// Скорость «марша» — пикселей в секунду для опорной длительности.
+// Реально скорость вычислим от геометрии, здесь — база для easeInOut.
+const MARCH_SPEED = 600;         // px/сек
 
 let WIDTH = 0;
 let HEIGHT = 0;
 let MARGIN_X = 0;
 let MARGIN_Y = 0;
-let ROW_GAP_Y = 0;
+let DOT_RADIUS = R_MAX;
 
 let startPositions = [];
 let targetPositions = [];
 let currentPositions = [];
+let waypoints = [];               // для каждой точки: [start, pivot, target]
+let segmentLengths = [];          // длины отрезков маршрута для каждой точки
+let pointDurations = [];          // длительность анимации для каждой точки
 let animStart = 0;
 let animating = false;
 
@@ -31,7 +44,6 @@ function layout() {
 
     MARGIN_X = Math.max(40, WIDTH * 0.05);
     MARGIN_Y = Math.max(40, HEIGHT * 0.08);
-    ROW_GAP_Y = Math.max(30, HEIGHT * 0.08);
 }
 
 function getUsableWidth() {
@@ -39,16 +51,25 @@ function getUsableWidth() {
     return Math.min(raw, MAX_FORMATION_WIDTH);
 }
 
-function getFormationLeft(width) {
-    return (WIDTH - width) / 2;
+// ---------- Список вариантов каре для заданной толщины t ----------
+
+function kareVariants(t, maxN) {
+    const result = [];
+    const nMin = 4 * t * t;
+    const step = 4 * t;
+    for (let n = nMin; n <= maxN; n += step) {
+        const m = n / (4 * t) + t;
+        result.push({ n, m });
+    }
+    return result;
 }
 
-// ---------- Один ряд ----------
+// ---------- Шеренга ----------
 
 function buildSingleRow(n) {
     const usableWidth = getUsableWidth();
     const step = n > 1 ? usableWidth / (n - 1) : 0;
-    const left = getFormationLeft(usableWidth);
+    const left = (WIDTH - usableWidth) / 2;
     const y = HEIGHT / 2;
     const positions = [];
     for (let i = 0; i < n; i++) {
@@ -57,47 +78,11 @@ function buildSingleRow(n) {
     return positions;
 }
 
-// ---------- N рядов (колонны) ----------
-// Договорённость: «вперёд» = вниз экрана.
-// Первый ряд (k=1) — передний, внизу; последний (k=rows) — задний, вверху.
-// Неполная колонна заполняется с переднего ряда, задние остаются пустыми.
-
-function buildFormation(n, rows) {
-    const mid = Math.floor((rows + 1) / 2);
-    const cols = Math.ceil(n / rows);
-
-    const usableWidth = getUsableWidth();
-    const frontStep = cols > 1 ? usableWidth / (cols - 1) : 0;
-    const formationLeft = getFormationLeft((cols - 1) * frontStep);
-
-    const positions = new Array(n);
-
-    for (let i = 0; i < n; i++) {
-        const col = Math.floor(i / rows);
-        const row = i % rows;
-
-        const x = formationLeft + col * frontStep;
-
-        const k = row + 1;
-        const offsetRows = mid - k;
-        const y = HEIGHT / 2 + offsetRows * ROW_GAP_Y;
-
-        positions[i] = { x, y };
-    }
-
-    return positions;
-}
-
 // ---------- Каре ----------
-// Квадрат m×m, заполняем по периметру.
-// Обход по часовой стрелке, начиная с переднего левого угла
-// (передняя сторона внизу — «вперёд» = вниз).
-// Если n < m² — заполняем периметр по порядку обхода.
+// Квадрат m x m со стенкой t. Слои снаружи внутрь.
+// В каждом слое — периметр по часовой стрелке с нижнего левого угла.
 
-function buildSquare(n) {
-    const m = Math.ceil(Math.sqrt(n));
-
-    // Шаг сетки каре — вписываем квадрат (m-1)*step в доступную область
+function buildKareGeometry(m, t) {
     const usableW = getUsableWidth();
     const usableH = HEIGHT - 2 * MARGIN_Y;
     const step = Math.min(
@@ -105,71 +90,165 @@ function buildSquare(n) {
         m > 1 ? usableH / (m - 1) : 0
     );
 
-    // Центр каре по центру экрана
-    const cx = WIDTH / 2;
-    const cy = HEIGHT / 2;
+    const originX = WIDTH / 2 - (m - 1) * step / 2;
+    const originY = HEIGHT / 2 - (m - 1) * step / 2;
 
-    // Левый верхний угол каре
-    const originX = cx - (m - 1) * step / 2;
-    const originY = cy - (m - 1) * step / 2;
+    const positions = [];
 
-    // Собираем позиции периметра по часовой стрелке,
-    // но начинаем с переднего левого угла (внизу-слева),
-    // т.е. (col=0, row=m-1), где row 0 — верх, row m-1 — низ.
-    // Для удобства построим координаты в терминах (col, row) сетки,
-    // затем переведём в пиксели.
+    for (let layer = 0; layer < t; layer++) {
+        const lo = layer;
+        const hi = m - 1 - layer;
+        if (lo > hi) break;
 
-    // Порядок обхода:
-    // 1) передняя сторона (низ): col 0..m-1, row m-1
-    // 2) правая сторона: col m-1, row m-2..0
-    // 3) задняя сторона (верх): col m-2..0, row 0
-    // 4) левая сторона: col 0, row 1..m-2
-    const perimeter = [];
-    if (m === 1) {
-        perimeter.push({ c: 0, r: 0 });
-    } else {
-        // 1) низ, слева направо
-        for (let c = 0; c < m; c++) perimeter.push({ c, r: m - 1 });
-        // 2) право, снизу вверх (без нижнего угла)
-        for (let r = m - 2; r >= 0; r--) perimeter.push({ c: m - 1, r });
-        // 3) верх, справа налево (без правого угла)
-        for (let c = m - 2; c >= 0; c--) perimeter.push({ c, r: 0 });
-        // 4) лево, сверху вниз (без верхнего и нижнего углов)
-        for (let r = 1; r <= m - 2; r++) perimeter.push({ c: 0, r });
+        if (lo === hi) {
+            positions.push({ x: originX + lo * step, y: originY + lo * step });
+            continue;
+        }
+
+        // 1) нижняя сторона: слева направо
+        for (let c = lo; c <= hi; c++) {
+            positions.push({ x: originX + c * step, y: originY + hi * step });
+        }
+        // 2) правая сторона: снизу вверх, без нижнего угла
+        for (let r = hi - 1; r >= lo; r--) {
+            positions.push({ x: originX + hi * step, y: originY + r * step });
+        }
+        // 3) верхняя сторона: справа налево, без правого угла
+        for (let c = hi - 1; c >= lo; c--) {
+            positions.push({ x: originX + c * step, y: originY + lo * step });
+        }
+        // 4) левая сторона: сверху вниз, без верхнего и нижнего углов
+        for (let r = lo + 1; r <= hi - 1; r++) {
+            positions.push({ x: originX + lo * step, y: originY + r * step });
+        }
     }
 
-    const count = Math.min(n, perimeter.length);
-    const positions = new Array(count);
-
-    for (let i = 0; i < count; i++) {
-        const { c, r } = perimeter[i];
-        positions[i] = {
-            x: originX + c * step,
-            y: originY + r * step
-        };
-    }
-
-    return positions;
+    return { positions, step, m };
 }
 
-// ---------- Выбор целевой фигуры ----------
+function computeDotRadius(m, step) {
+    // Радиус зависит от m и шага сетки
+    const byStep = step * 0.35;
+    const byM = 80 / Math.sqrt(m * m); // грубая эвристика
+    const r = Math.min(R_MAX, Math.max(R_MIN, Math.min(byStep, byM)));
+    return r;
+}
 
-function buildTarget(n, rows, shape) {
-    if (shape === 'square') return buildSquare(n);
-    if (rows <= 1) return buildSingleRow(n);
-    return buildFormation(n, rows);
+// ---------- Построение маршрутов ----------
+// Для каждой точки: [start, pivot, target].
+// pivot — промежуточная точка: сначала идём по X, потом по Y.
+
+function buildRoutes(start, target) {
+    const routes = [];
+    const segLens = [];
+    const durations = [];
+
+    for (let i = 0; i < start.length; i++) {
+        const a = start[i];
+        const b = target[i];
+        const pivot = { x: b.x, y: a.y }; // сначала по X, потом по Y
+
+        const dx1 = pivot.x - a.x;
+        const dy1 = pivot.y - a.y;
+        const dx2 = b.x - pivot.x;
+        const dy2 = b.y - pivot.y;
+        const len1 = Math.hypot(dx1, dy1);
+        const len2 = Math.hypot(dx2, dy2);
+        const total = len1 + len2;
+
+        routes.push([a, pivot, b]);
+        segLens.push([len1, len2]);
+        durations.push(total);
+    }
+
+    return { routes, segLens, durations };
+}
+
+// ---------- UI ----------
+
+function fillThicknessOptions() {
+    const sel = document.getElementById('thickness');
+    sel.innerHTML = '';
+    for (let t = 1; t <= MAX_T; t++) {
+        const opt = document.createElement('option');
+        opt.value = t;
+        opt.textContent = t;
+        sel.appendChild(opt);
+    }
+}
+
+function fillCountOptions() {
+    const t = parseInt(document.getElementById('thickness').value, 10) || 1;
+    const sel = document.getElementById('count');
+    const prev = parseInt(sel.value, 10);
+
+    sel.innerHTML = '';
+    const variants = kareVariants(t, MAX_N);
+
+    for (const { n, m } of variants) {
+        const opt = document.createElement('option');
+        opt.value = n;
+        opt.textContent = `${n} (${m}×${m})`;
+        sel.appendChild(opt);
+    }
+
+    if (variants.some(v => v.n === prev)) {
+        sel.value = String(prev);
+    }
+}
+
+// ---------- Перестроение ----------
+
+function rebuild() {
+    const t = parseInt(document.getElementById('thickness').value, 10) || 1;
+    const n = parseInt(document.getElementById('count').value, 10);
+    if (!n) return;
+
+    const m = n / (4 * t) + t;
+
+    const { positions: karePositions, step } = buildKareGeometry(m, t);
+    DOT_RADIUS = computeDotRadius(m, step);
+
+    // Старт всегда — шеренга из n точек
+    startPositions = buildSingleRow(n);
+    targetPositions = karePositions.slice(0, n);
+
+    // Маршруты: для каждой точки [start, pivot, target]
+    const { routes, segLens, durations } = buildRoutes(startPositions, targetPositions);
+    waypoints = routes;
+    segmentLengths = segLens;
+    pointDurations = durations;
+
+    // Текущие позиции начинаем с начала маршрута
+    currentPositions = startPositions.map(p => ({ ...p }));
+
+    animStart = performance.now();
+    animating = true;
+}
+
+// ---------- Сброс ----------
+
+function reset() {
+    const n = currentPositions.length || INITIAL_N;
+    currentPositions = buildSingleRow(n);
+    startPositions = currentPositions.map(p => ({ ...p }));
+    targetPositions = currentPositions.map(p => ({ ...p }));
+    waypoints = [];
+    segmentLengths = [];
+    pointDurations = [];
+    animating = false;
+    draw();
 }
 
 // ---------- Отрисовка ----------
 
 function drawFacingArrow() {
     const x = MARGIN_X / 2;
-    const topY = HEIGHT / 2 - ROW_GAP_Y;
-    const bottomY = HEIGHT / 2 + ROW_GAP_Y;
+    const topY = HEIGHT / 2 - 40;
+    const bottomY = HEIGHT / 2 + 40;
     const headSize = 10;
 
     ctx.save();
-
     ctx.strokeStyle = '#6ec1ff';
     ctx.lineWidth = 2;
     ctx.beginPath();
@@ -190,7 +269,6 @@ function drawFacingArrow() {
     ctx.textAlign = 'center';
     ctx.textBaseline = 'top';
     ctx.fillText('вперёд', x, bottomY + 6);
-
     ctx.restore();
 }
 
@@ -205,61 +283,72 @@ function draw() {
     }
 }
 
+// ---------- Анимация ----------
+
 function tick(now) {
     if (animating) {
-        const t = Math.min((now - animStart) / ANIM_DURATION, 1);
-        const e = easeInOut(t);
         for (let i = 0; i < currentPositions.length; i++) {
-            const a = startPositions[i];
-            const b = targetPositions[i];
-            currentPositions[i].x = a.x + (b.x - a.x) * e;
-            currentPositions[i].y = a.y + (b.y - a.y) * e;
+            const route = waypoints[i];
+            if (!route) continue;
+
+            const [a, pivot, b] = route;
+            const [len1, len2] = segmentLengths[i];
+            const total = len1 + len2;
+
+            // Длительность для этой точки при равной скорости:
+            // длительность = дистанция / MARCH_SPEED, но не меньше опорной
+            const ownDuration = total > 0
+                ? Math.max(ANIM_DURATION * (total / MARCH_SPEED) / 2, 300)
+                : 0;
+
+            // Все стартуют одновременно: время t — общее, но у каждой точки
+            // свой финиш. t нормируем по максимальной длительности среди всех.
+            // Для простоты: общая длительность = max(pointDurations) / MARCH_SPEED,
+            // но чтобы не усложнять — используем общий MAX_ANIM_DURATION.
+            const elapsed = now - animStart;
+            const tLocal = ownDuration > 0 ? Math.min(elapsed / ownDuration, 1) : 1;
+            const e = easeInOut(tLocal);
+
+            // Проходим маршрут по двум отрезкам
+            const pos = moveAlong(a, pivot, b, len1, len2, e);
+            currentPositions[i].x = pos.x;
+            currentPositions[i].y = pos.y;
         }
-        if (t >= 1) animating = false;
+
+        // Конец анимации — когда все дошли
+        const allDone = waypoints.every((_, i) => {
+            const [len1, len2] = segmentLengths[i];
+            const total = len1 + len2;
+            const ownDuration = total > 0
+                ? Math.max(ANIM_DURATION * (total / MARCH_SPEED) / 2, 300)
+                : 0;
+            return now - animStart >= ownDuration;
+        });
+        if (allDone) animating = false;
     }
     draw();
     requestAnimationFrame(tick);
 }
 
-// ---------- Перестроение ----------
+// Позиция на маршруте из двух отрезков по прогрессу e (0..1)
+function moveAlong(a, pivot, b, len1, len2, e) {
+    const total = len1 + len2;
+    if (total === 0) return { x: a.x, y: a.y };
+    const dist = e * total;
 
-function readInputs() {
-    const n = Math.max(2, Math.min(100, parseInt(document.getElementById('count').value, 10) || 10));
-    document.getElementById('count').value = n;
-    const rows = Math.max(1, Math.min(n, parseInt(document.getElementById('rows').value, 10) || 1));
-    const shape = document.getElementById('shape').value;
-    return { n, rows, shape };
-}
-
-function rebuild() {
-    const { n, rows, shape } = readInputs();
-
-    const newTarget = buildTarget(n, rows, shape);
-
-    // Если изменилось число точек — стартуем из одного ряда.
-    // Если нет — стартуем из текущего положения.
-    if (currentPositions.length !== n) {
-        startPositions = buildSingleRow(n);
-        currentPositions = startPositions.map(p => ({ ...p }));
+    if (dist <= len1) {
+        const f = len1 > 0 ? dist / len1 : 0;
+        return {
+            x: a.x + (pivot.x - a.x) * f,
+            y: a.y + (pivot.y - a.y) * f
+        };
     } else {
-        startPositions = currentPositions.map(p => ({ ...p }));
+        const f = len2 > 0 ? (dist - len1) / len2 : 0;
+        return {
+            x: pivot.x + (b.x - pivot.x) * f,
+            y: pivot.y + (b.y - pivot.y) * f
+        };
     }
-
-    // Для каре целевых позиций может быть меньше, чем точек (n > m²).
-    // В этом случае лишние точки не анимируются в новые места,
-    // а «схлопываются» — для простоты оставляем их на последних позициях.
-    // Практически: выравниваем длины — обрезаем или дублируем последнюю.
-    if (newTarget.length < n) {
-        while (newTarget.length < n) {
-            newTarget.push({ ...newTarget[newTarget.length - 1] });
-        }
-    } else if (newTarget.length > n) {
-        newTarget.length = n;
-    }
-
-    targetPositions = newTarget;
-    animStart = performance.now();
-    animating = true;
 }
 
 // ---------- Ресайз ----------
@@ -272,19 +361,11 @@ window.addEventListener('resize', () => {
 
         const n = currentPositions.length;
         if (n === 0) return;
-        const { rows, shape } = readInputs();
 
-        targetPositions = buildTarget(n, rows, shape);
-        if (targetPositions.length < n) {
-            while (targetPositions.length < n) {
-                targetPositions.push({ ...targetPositions[targetPositions.length - 1] });
-            }
-        } else if (targetPositions.length > n) {
-            targetPositions.length = n;
-        }
-
-        currentPositions = targetPositions.map(p => ({ ...p }));
-        startPositions = targetPositions.map(p => ({ ...p }));
+        // Мгновенно перестроить в шеренгу (как «Сброс»)
+        currentPositions = buildSingleRow(n);
+        startPositions = currentPositions.map(p => ({ ...p }));
+        targetPositions = currentPositions.map(p => ({ ...p }));
         animating = false;
         draw();
     }, 100);
@@ -292,30 +373,19 @@ window.addEventListener('resize', () => {
 
 // ---------- Старт ----------
 
-(function fillRowOptions() {
-    const sel = document.getElementById('rows');
-    sel.innerHTML = '';
-    for (let r = 1; r <= 10; r++) {
-        const opt = document.createElement('option');
-        opt.value = r;
-        opt.textContent = r;
-        if (r === 2) opt.selected = true;
-        sel.appendChild(opt);
-    }
-})();
+fillThicknessOptions();
+fillCountOptions();
 
+document.getElementById('thickness').addEventListener('change', fillCountOptions);
 document.getElementById('build').addEventListener('click', rebuild);
+document.getElementById('reset').addEventListener('click', reset);
 
 function init() {
     layout();
-
-    const { n } = readInputs();
-
-    currentPositions = buildSingleRow(n);
+    currentPositions = buildSingleRow(INITIAL_N);
     startPositions = currentPositions.map(p => ({ ...p }));
     targetPositions = currentPositions.map(p => ({ ...p }));
     animating = false;
-
     draw();
 }
 
